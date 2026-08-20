@@ -1,0 +1,121 @@
+name: Deploy Gitea Vuln Lab
+
+# Adapted from emulateai-dev/dtx_copen_labs' .github/workflows/deploy-runner.yml.
+# That workflow picks WHICH of several labs to deploy (checkboxes) but always
+# deploys "branch" for all of them. We're the opposite shape: one lab, many
+# vuln branches — so the thing you choose is WHICH BRANCH (main = patched
+# baseline, vuln/CVE-xxxx-xxxxx = that one CVE reintroduced), not which lab.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy (main = patched, vuln/CVE-xxxx-xxxxx = that CVE reintroduced)'
+        required: true
+        default: 'main'
+        type: string
+      action:
+        description: 'Deployment Action Mode'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+          - deploy
+          - restart_with_rebuild
+          - restart_only
+          - restart_with_wipe
+
+jobs:
+  manage-runner:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ─────────────────────────────────────────────────────────────────────
+      # Stage 1 — Code Sync
+      # Only runs on 'deploy' — the restart_* modes intentionally reuse
+      # whatever branch is already checked out on the box, so a bad deploy
+      # can be restarted/rebuilt without silently switching code underneath it.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Stage 1 - Code Sync
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          command_timeout: 10m
+          script: |
+            if [ "${{ github.event.inputs.action }}" == "deploy" ]; then
+              cd /opt/dtx_copen_labs/remediation_harness/gitea || exit 1
+              DEPLOY_BRANCH="${{ github.event.inputs.branch }}"
+              DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
+              echo "--- Synchronizing gitea-vuln-lab (branch: $DEPLOY_BRANCH) ---"
+              git fetch --all
+              git checkout "$DEPLOY_BRANCH" || exit 1
+              git reset --hard "origin/$DEPLOY_BRANCH"
+            fi
+
+      # ─────────────────────────────────────────────────────────────────────
+      # Stage 2 — Deploy + Verify
+      # A vuln-branch swap always needs a real image rebuild (the vuln lives
+      # in compiled Go/JS, not in mounted config) — so unlike the multi-lab
+      # workflow's "restart_only" (which just restarts an already-correct
+      # container), here even the lightest restart mode still checks whether
+      # the checked-out commit actually matches the running image, and forces
+      # a rebuild if not. Silently restarting the OLD image after a branch
+      # switch would look successful while quietly still serving the wrong
+      # vuln state.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Stage 2 - Deploy and Verify
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          command_timeout: 30m
+          script: |
+            cd /opt/dtx_copen_labs/remediation_harness/gitea || exit 1
+
+            # GIT_COMMIT is baked into the running container as a label
+            # (vuln_lab.git_commit, see docker-compose.yml) so restart_only
+            # can tell whether the checked-out branch actually matches what's
+            # running, instead of assuming a restart is safe.
+            export GIT_COMMIT=$(git rev-parse HEAD)
+            RUNNING_COMMIT=$(docker inspect gitea-vuln-lab --format '{{ index .Config.Labels "vuln_lab.git_commit" }}' 2>/dev/null || echo "")
+
+            case "${{ github.event.inputs.action }}" in
+              "deploy"|"restart_with_rebuild")
+                docker compose build gitea || exit 1
+                docker compose up -d gitea || exit 1
+                ;;
+              "restart_only")
+                if [ "$GIT_COMMIT" != "$RUNNING_COMMIT" ]; then
+                  echo "::warning::Checked-out commit ($GIT_COMMIT) doesn't match the running image ($RUNNING_COMMIT) — rebuilding instead of a plain restart, otherwise this would silently keep serving the wrong vuln state."
+                  docker compose build gitea || exit 1
+                  docker compose up -d gitea || exit 1
+                else
+                  docker compose restart gitea || exit 1
+                fi
+                ;;
+              "restart_with_wipe")
+                docker compose down -v || exit 1
+                docker compose build gitea || exit 1
+                docker compose up -d || exit 1
+                ;;
+            esac
+
+            echo "Waiting 10 seconds for Gitea to come up..."
+            sleep 10
+
+            echo "--- Container status ---"
+            docker compose ps
+
+            echo "--- Port check (3000) ---"
+            if curl -s -I "http://localhost:3000" > /dev/null 2>&1; then
+              echo "gitea-vuln-lab is UP on port 3000"
+            else
+              echo "::error::gitea-vuln-lab is unresponsive on port 3000!"
+              exit 1
+            fi
+
+            echo "--- Version reported ---"
+            curl -s "http://localhost:3000/api/v1/version" || echo "::warning::version endpoint check failed"

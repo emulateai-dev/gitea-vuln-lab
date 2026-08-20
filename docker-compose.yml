@@ -5,6 +5,8 @@ services:
       args:
         GITEA_VERSION: "1.27.0"
     container_name: gitea-vuln-lab
+    labels:
+      - "vuln_lab.git_commit=${GIT_COMMIT:-unknown}"
     environment:
       - USER_UID=1000
       - USER_GID=1000
