@@ -70,15 +70,7 @@ func Render(ctx *markup.RenderContext, input io.Reader, output io.Writer) error 
 	w := &orgWriter{rctx: ctx, HTMLWriter: htmlWriter}
 	htmlWriter.ExtendingWriter = w
 
-	cfg := org.New()
-	cfg.ReadFile = func(path string) ([]byte, error) {
-		// actually the orgmode render doesn't support rendering the content from the content again,
-		// so just leave the plain text to end users
-		content := fmt.Sprintf("#+INCLUDE: [[%s]]", path)
-		return []byte(content), nil
-	}
-	doc := cfg.Silent().Parse(input, "")
-	res, err := doc.Write(w)
+	res, err := org.New().Silent().Parse(input, "").Write(w)
 	if err != nil {
 		return fmt.Errorf("orgmode.Render failed: %w", err)
 	}
