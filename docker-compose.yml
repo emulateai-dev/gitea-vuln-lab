@@ -3,7 +3,7 @@ services:
     build:
       context: .
       args:
-        GITEA_VERSION: dev
+        GITEA_VERSION: "1.27.0"
     container_name: gitea-vuln-lab
     environment:
       - USER_UID=1000
